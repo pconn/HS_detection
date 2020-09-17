@@ -1,0 +1,542 @@
+---
+title: "Harbor seal detection analysis"
+author: "Paul Conn"
+date: "4/6/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data import
+
+This document describes a hierarchical analysis of harbor seal detection trial data.  Let's start by bringing in survey data, including historical survey data (human observer only) for four years prior to 2019, as well as the detection data for FLIR trials in 2019: 
+
+```{r load}
+Old_data = read.csv("./data/HarborSeal_BaselineCounts_2015-2018_20200413_SKH.csv")
+New_data = read.csv("./data/HarborSeal_FLIRCounts_2019_20200413_SKH.csv")
+Old_data$survey_dt = anytime::anytime(Old_data$survey_dt,asUTC=T)  #convert to POSIXct
+New_data$survey_dt = anytime::anytime(New_data$survey_dt,asUTC=T)
+Old_data$nearest_low_dt = anytime::anytime(Old_data$nearest_low_dt,asUTC=T)
+New_data$nearest_low_dt = anytime::anytime(New_data$nearest_low_dt,asUTC=T)
+head(Old_data)
+head(New_data)
+```
+
+We'll also query the database for spatial location information for each polygon.  Information on location is necessary to calculate solar time, one variable we are interested in controlling for.
+
+# note : I ran this code to do the query but you can't knit using the rstudioapi library...
+#{r query, cache=TRUE}
+#library(sf)
+#con <- RPostgreSQL::dbConnect(RPostgreSQL::PostgreSQL(), 
+#                              dbname = Sys.getenv("pep_db"), 
+#                              host = Sys.getenv("pep_ip"), 
+#                              user = Sys.getenv("pep_user"), 
+#                              rstudioapi::askForPassword(paste("Enter your DB password for user account: ", #Sys.getenv("pep_user"), sep = "")))
+#poly_locs <- sf::st_read_db(con, 
+#                          query = "SELECT *
+#FROM surv_pv_cst.geo_polys_midpt
+#WHERE polyid IN
+#( SELECT polyid FROM surv_pv_cst.summ_flir_trial_2019)", 
+#                          geom_column = "geom")
+#save(poly_locs,file="poly_locs.RDa")
+
+
+```{r query}
+load("./data/poly_locs.RDa")
+```
+
+## Data manipulation
+
+Our analysis will focus only on polygons surveyed in 2019.  Let's define a few variables for future analysis and limit 'old' survey data to those polygons we're intersted in. limit experimental data to pairs that meet this qualification and assemble a list (well, vector really) of unique polygons. 
+
+```{r subset1}
+Unique_polys = unique(New_data$polyid)
+New_data$FLIR = !is.na(New_data$flir_count_obs)  #=0 if a human count, =1 if FLIR count
+n_reps = length(New_data$FLIR)
+New_data$Recon = rep(0,n_reps)
+for(irep in 1:n_reps){
+  if(length(grep("no recon",New_data$effort_type[irep]))==0)New_data$Recon[irep]=1
+}
+n_poly = length(Unique_polys)
+Old_data = Old_data[Old_data$polyid %in% Unique_polys,]
+Old_data = Old_data[-which(as.character(Old_data$effort_type)=="Partial survey"),]
+```
+
+
+
+Let's make sure we have some other important predictors in both datasets: time from closest low tide, hour-of-day in solar time (as difference from solar noon), sky cover, and altitude relative to the baseline level (750ft).
+
+```{r tide2}
+New_data$tide_diff =  as.numeric(New_data$survey_dt-New_data$nearest_low_dt)/60
+New_data$tide_diff2 = New_data$tide_diff^2
+Old_data$tide_diff = as.numeric(Old_data$survey_dt-Old_data$nearest_low_dt)/60
+Old_data$tide_diff2 = Old_data$tide_diff^2
+Which_poly = rep(0,nrow(New_data))
+for(irow in 1:nrow(New_data))Which_poly[irow]=which(poly_locs$polyid==New_data$polyid[irow])
+New_data$lon = poly_locs$longitude[Which_poly]
+New_data$lat = poly_locs$latitude[Which_poly]
+Which_poly = rep(0,nrow(Old_data))
+for(irow in 1:nrow(Old_data))Which_poly[irow]=which(poly_locs$polyid==Old_data$polyid[irow])
+Old_data$lon = poly_locs$longitude[Which_poly]
+Old_data$lat = poly_locs$latitude[Which_poly]
+attr(Old_data$survey_dt, "tzone") <- "America/Adak"
+attr(New_data$survey_dt, "tzone") <- "America/Adak"
+New_data$solar_hr = lubridate::hour(solaR::local2Solar(New_data$survey_dt,lon=New_data$lon))-12
+Old_data$solar_hr = lubridate::hour(solaR::local2Solar(Old_data$survey_dt,lon=Old_data$lon))-12
+Old_data$sky = 0
+Sky = rep(0,nrow(New_data))
+Sky[which(New_data$sky_cover=="0-5")]=0.025
+Sky[which(New_data$sky_cover=="5-30")]=0.175
+Sky[which(New_data$sky_cover=="30-55")]=0.425
+Sky[which(New_data$sky_cover=="55-95")]=0.75
+Sky[which(New_data$sky_cover=="95-100")]=0.975
+New_data$sky = Sky
+New_data$alt = (New_data$altitude_flir_trial-750)/1000
+Old_data$alt = 0
+
+```
+
+## Modeling
+
+We will attempt to fit a model to count data obtained both from 2015-2018 surveys, as well as 2019 experimental data.  For each polygon surveyed, $C_{i,j,k}$ gives the count of seals obtained at trial $k$ ($k \in \{ 1,2 \}$) of visit $j$ to polygon $i$ according to the formulation. 
+
+\begin{eqnarray*}
+    C_{i,j,k} & \sim & \text{Poisson}(\lambda_{i,j,k})  \\
+    \log(\lambda_{i,j,k}) & = & \beta_0 + (k-1) \beta_1 +
+     + \alpha_0 I_{i,j,k} + \alpha_1 I_{i,j,k} a_{i,j,k} + \alpha_2 I_{i,j,k} a_{i,j,k}^2 + \\
+     & & \xi O_{i,j,k} I_{i,j,k} + \omega_1 h_{i,j,k} + \omega_2 h_{i,j,k}^2 + \omega_3 h_{i,j,k} I_{i,j,k} + \kappa s_{i,j,k} I_{i,j,k} + 
+     \theta_1 t_{i,j,k} + \theta_2 t_{i,j,k}^2 + 
+     \epsilon_p(i) + \epsilon_v(i,j,k) .
+\end{eqnarray*}
+
+Note that for 2015-2018 surveys, there is only one ``pass" of each polygon; i.e. $k=1$ for all 2015-2018 surveys.
+
+Notation is defined as follows:
+\begin{itemize}
+    \item $\beta_0$ is an overall intercept (expected log-scale count)
+    \item $\beta_1$ is a fixed effect for 2nd passes of a polygon, 
+    \item $\alpha_0$, $\alpha_1$, and $\alpha_2$ are parameters describing the difference in expected counts between the thermal method and human observer detection method, which may vary based on the survey altitude,
+    \item $a_{i,j,k}$ is the altitude of the aircraft in thermal surveys relative to the altitude of human observer surveys,
+    \item $I_{i,j,k}$ is an indicator taking on 1.0 if the detection method on trial $k$ of visit $j$ to polygon $i$ was the thermal (infrared) method, 
+    \item $\xi$ is an observer experience effect,
+    \item $O_{i,j,k}$ is the number of polygons an observer has previously surveyed with the FLIR (with the idea that more experience may lead to higher counts),
+    \item $\omega_1$, $\omega_2$, and $\omega_3$ are hour-of-day effects on survey counts; $\omega_1$ and $\omega_2$ are linear and quadratic effects describing variation attributable to changes in seal haul-out behavior - they thus apply to both survey methods; $\omega_3$ gives an additional effect of hour-of-day on thermal counts (with the thought that the efficacy of thermal counts may decrease throughout the day as background medium warms).
+    \item $h_{i,j,k}$ is the difference between the solar hour-of-day and solar noon,
+    \item $\kappa$ is a linear effect of sky cover on infrared survey counts, 
+    \item $s_{i,j,k}$ is the proportion of sky cover noted when beginning a survey of a particular polygon (a mean value was used if a range was provided), 
+    \item $\theta_1$ and $\theta_2$ are linear and quadratic tide effects,
+    \item $t_{i,j,k}$ is the difference between the hour surveyed and the hour of the closest low tide,
+    \item $\epsilon_p(i) \sim \mathcal{N}(0,1/\tau_p)$ is random, normally distributed error associated with counts of polygon $i$, and
+    \item $\epsilon_t(i,j,k) \sim \mathcal{N}(0,1/ \tau_t)$ is random, normally distributed error associated with trial $k$ of visit $j$ to polygon $i$ (this is intended to permit overdispersion relative to the Poisson distrution)
+\end{itemize}
+
+We'll adopt a Bayesian perspective and use JAGS to fit this hierarchical model, which requires specifying prior distributions for model parameters (i.e., $\beta_0,\beta_1,\alpha_0,\alpha_1,\alpha_2,\xi,\omega_1,\omega_2,\omega_3,\kappa,\theta_1,\theta_2,\tau_p,\tau_t$).  
+We specified relatively flat $\mathcal{N}(0,100)$ priors for regression parameters and imprecise $\text{Gamma}(1.0,0.1)$ priors for precision parameters $\{ \tau_p, \tau_t \}$.  
+Our goal will be to make inferences about the relative efficiency of different survey methods under different conditions and altitudes by examining posterior distributions of model parameters.  Let's first write the above model in \texttt{jags}, 
+
+```{r jags}
+#jags model
+library(R2jags)
+jags.HS <- function(){
+  for(i in 1:n_count){
+    Count[i]~dpois(Exp_count[i])
+    Exp_count[i]<-exp(intercept + X[i,1]*beta1 +    
+                      X[i,3]*alpha0+X[i,4]*alpha1+X[i,5]*alpha2+X[i,6]*xi+
+                      omega0 * X[i,7] + omega1*X[i,8] + omega2 * X[i,9] + 
+                      kappa * X[i,10] + theta1 * X[i,11] + theta2*X[i,12] + Epsilon_p[i] + Epsilon_t[i])
+    Epsilon_t[i] ~ dnorm(0,tau_t)
+  }
+  
+  Epsilon_p = X_poly %*% Eps_poly
+  for(i in 1:n_poly){
+    Eps_poly[i] ~ dnorm(0,tau_p)
+  }
+  
+  
+  #priors
+  intercept~dnorm(0,.01)
+  beta1~dnorm(0,.01)
+  alpha0~dnorm(0,.01)
+  alpha1~dnorm(0,.01)
+  alpha2~dnorm(0,.01)
+  xi~dnorm(0,.01)
+  omega0~dnorm(0,.01)
+  omega1~dnorm(0,.01)
+  omega2~dnorm(0,.01)
+  kappa~dnorm(0,.01)
+  theta1~dnorm(0,.01)
+  theta2~dnorm(0,.01)
+
+  tau_p ~ dgamma(1.0,0.1)
+  tau_t ~ dgamma(1.0,0.1)
+}
+```
+
+We need to define some design matrices, put data into an appropriate format for \texttt{jags}, provide a list of parameters and set initial values before running this model.  Let's do that:
+
+```{r jags setup}
+
+n_old = nrow(Old_data)
+n_new = nrow(New_data)
+n_count = n_old+n_new
+Rep_id = paste(lubridate::yday(New_data$survey_dt),New_data$polyid)
+Unique_rep = unique(Rep_id)
+n_unique_rep = length(Unique_rep)
+X_rep = matrix(0,n_new,n_unique_rep) #maps each count (row) to a survey replicate (column)
+for(irep in 1:n_unique_rep){
+  Which = which(Rep_id==Unique_rep[irep])
+  X_rep[Which,irep]=1
+}
+X_rep = Matrix::bdiag(diag(n_old),X_rep)  #treat each survey in 2015-2018 as separate rep
+#note I'm not currently using X_rep 
+
+#now need a matrix mapping each count to a particular polygon
+X_poly = matrix(0,n_count,n_poly)
+Polys = c(as.character(Old_data$polyid),as.character(New_data$polyid))
+for(ipoly in 1:n_poly){
+  Which = which(Polys==Unique_polys[ipoly])
+  X_poly[Which,ipoly]=1
+}
+
+#now a design matrix for fixed effects (regression)
+X = matrix(0,n_count,12)
+X[(n_old+1):(n_old+n_new),1]=New_data$track_rep-1
+X[(n_old+1):(n_old+n_new),2]=(New_data$track_rep-1)*New_data$alt #note: not currently using
+X[(n_old+1):(n_old+n_new),3]=1*(New_data$FLIR)
+X[(n_old+1):(n_old+n_new),4]=New_data$FLIR*New_data$alt
+X[(n_old+1):(n_old+n_new),5]=New_data$FLIR*New_data$alt^2
+Flir_count = New_data$flir_count_obs-1
+Flir_count[is.na(Flir_count)]=0
+X[(n_old+1):(n_old+n_new),6]=New_data$FLIR*Flir_count
+Hr = c(Old_data$solar_hr,New_data$solar_hr)
+X[,7]=Hr
+X[,8]=Hr^2
+X[(n_old+1):(n_old+n_new),9]=New_data$solar_hr*New_data$FLIR
+X[(n_old+1):(n_old+n_new),10]=New_data$FLIR*New_data$sky
+Tide = c(Old_data$tide_diff,New_data$tide_diff)
+X[,11] = Tide
+X[,12] = Tide^2
+
+Count = c(Old_data$num_seals,New_data$num_seals)
+Count[which(is.na(Count))]=0  
+data <- list(X=X,Count=c(Old_data$num_seals,New_data$num_seals),n_count=nrow(X),
+             X_rep=as.matrix(X_rep),X_poly = X_poly, n_rep=ncol(X_rep),n_poly=n_poly)
+
+init.values <- function(){
+  list(intercept=runif(1,20,200),beta1=.1*rnorm(1),alpha0=.1*rnorm(1),alpha1=.1*rnorm(1),
+       alpha2=.1*rnorm(1),xi=.1*rnorm(1),omega0=.1*rnorm(1),omega1=.1*rnorm(1),
+       omega2=.1*rnorm(1),kappa=.1*rnorm(1),theta1=.1*rnorm(1),theta2=.1*rnorm(1),
+       tau_t=runif(1,50,150),tau_p=runif(1,50,150), #Eps_rep_2=0.1*rnorm(138,0,1),
+       Eps_poly = rnorm(n_poly,0,1))
+}
+```
+
+Great!  Now let's call jags, setting a random number seed so we can make sure to replicate our results. 
+
+```{r run jags, cache=TRUE}
+
+# MCMC settings
+set.seed(12345)  
+ada=3000  # number of 'adapt' iterations
+iter=60000      
+nchains=3  
+nburnin=10000      
+nthin=5
+inits <- init.values()  
+
+## Parameters to be monitored (= to estimate)
+params =  c("intercept","beta1","alpha0","alpha1","alpha2","xi","omega0","omega1","omega2",
+            "kappa","theta1","theta2","tau_p","tau_t","Eps_poly")
+jags_save = c(params) 
+
+jags_fit = jags(data=data,
+                inits=init.values,
+                params,
+                n.iter=iter,
+                model.file=jags.HS,
+                DIC=TRUE,
+                parameters.to.save=jags_save,
+                n.chains=nchains,
+                n.burnin=nburnin,
+                n.thin=nthin,
+                working.directory=getwd()) 
+
+
+```
+
+Great!  Looks like it ran without errors.  Let's check trace plots to make sure chains have converged to their statitionary distributions.
+
+```{r coda}
+
+samps <- coda::as.mcmc(jags_fit)
+mcmcplots::mcmcplot(samps)
+coda::gelman.diag(samps)
+
+```
+
+Okay there's a lot there...but things seemed to have converged for the most part...e.g. trace plots mix well and Gelman-Rubin diagnostics are almost all less than 1.1. we could maybe run chains a little longer if we were interested in a higher effective sample size for Mu parameters, but we're not really interested in those...all the regression parameters seem to be well estimated.  Taking a look at histograms we can see what effects pop out as important (e.g. effects whose posterior mass differ substantially from zero).  We can also plot marginal effects if we want.
+
+\textbf{Effects of FLIR on survey counts}  
+
+The primary mass of the posterior distribution of $\alpha_0$ is slightly below, but overlapping zero, indicating that at 750 ft (and with clear skies and at solar noon), the performance of the FLIR method is perhaps slightly worse, but by-and-large similar to the human observation method.  The relationship seems to change as a function of altitude though (seeing how the $\alpha_1$ term has posterior mass below zero and $\alpha_2$ has posterior mass above zero).  It's hard to see the direct effect without plotting it.  Let's do that.
+
+```{r alpha}
+Altitude = c(75:230)*10
+Alt = (Altitude-750)/1000 
+Alpha0=sample(jags_fit$BUGSoutput$sims.list$alpha0,10000,replace=T)
+Alpha1=sample(jags_fit$BUGSoutput$sims.list$alpha1,10000,replace=T)
+Alpha2=sample(jags_fit$BUGSoutput$sims.list$alpha2,10000,replace=T)
+Mean = Lower = Upper = rep(0,length(Alt))
+for(ialt in 1:length(Alt)){
+  Preds = Alpha0+Alpha1*Alt[ialt]+Alpha2*(Alt[ialt])^2
+  Mean[ialt] = mean(Preds)
+  Lower[ialt] = quantile(Preds,0.025)
+  Upper[ialt] = quantile(Preds,0.975)
+}
+  
+Plot.df = data.frame(Altitude=Altitude,Mean = Mean,Lower=Lower,Upper=Upper )
+library(ggplot2)
+ggplot()+geom_line(data=Plot.df,aes(x=Altitude,y=Mean))+
+  geom_ribbon(data=Plot.df,aes(x=Altitude,ymin=Lower,ymax=Upper),alpha=0.4)+
+  ylab('Effect (log-scale)')
+
+```
+
+Okay, so it looks like the FLIR performs worse than the human observer method, at least at reference conditions (equal counts would be indicated if this value was 0, lower counts are indicated if the effect on counts is negative).  However, the parabolic shape of this relatinoship is counter-intuitive. I think it's more likely that the FLIR method either increases with altitude or decreases with altitude... there may be some confounding effects, e.g. if higher altitudes were only surveyed on nicer days when sky cover was less (we'll look at those effects in a second).  Also, realize this plot is standardized to solar noon and on 0 cloud cover.  So, it may not quite be the end of the story.
+
+\textbf{Effects of first pass on survey counts}  
+
+The posterior distribution for $\beta_1$ had mass substantially above zero, indicating that the second pass tends to have higher counts than the first pass in experimental trials.  The posterior mean prediction provides an estimate of the proportional increase on the second pass (compared to the first, everything else being equal):
+
+```{r beta}
+mean(exp(jags_fit$BUGSoutput$sims.list$beta1))
+
+```
+
+On the second pass, it looks like we tend to count more seals than in the first pass.  Perhaps disturbance is not much of an issue between passes, and instead human observers are learning where seals are on the first pass, resulting in increased counts on the second pass.
+
+
+\textbf{FLIR-operator experience}
+
+Posterior distributions of $\xi$ were centered near zero, but were slightly positive, providing weak evidence that counts increased with FLIR-operator experience.  
+
+```{r xi}
+Experience = c(0:12)
+Xi=sample(jags_fit$BUGSoutput$sims.list$xi,10000,replace=T)
+Mean = Lower = Upper = rep(0,length(Experience))
+for(iexp in 1:length(Experience)){
+  Preds = Xi*Experience[iexp]
+  Mean[iexp] = mean(Preds)
+  Lower[iexp] = quantile(Preds,0.025)
+  Upper[iexp] = quantile(Preds,0.975)
+}
+  
+Plot.df = data.frame(Experience=Experience,Mean = 
+        Mean,Lower=Lower,Upper=Upper)
+library(ggplot2)
+ggplot()+geom_line(data=Plot.df,aes(x=Experience,y=Mean))+
+  geom_ribbon(data=Plot.df,aes(x=Experience,ymin=Lower,ymax=Upper),alpha=0.4)+
+  ylab('Effect (log-scale)')
+
+```
+
+
+However, given anecdotal evidence, we may just not have summarized it in a useful way or it may have been overshadowed by other factors (natural variability in seal abundance, differences in observer skill).  For instance, fitting a Poisson generalized additive model to survey counts suggests increasing counts with experience:
+
+```{r xi gam}
+FLIR_data = New_data[New_data$FLIR==1,]
+FLIR_data$num_seals[which(is.na(FLIR_data$num_seals))]=0
+FLIR_data$flir_count_obs = FLIR_data$flir_count_obs-1
+plot(mgcv::gam(num_seals~s(flir_count_obs,k=4),family="poisson",data=FLIR_data))
+
+```
+
+\texttt{Hour-of-day effects}
+
+Our model allows us to examine overall hour-of-day effects, as well as whether they differ based on FLIR vs. human observer.  All three relevant parameters have posterior mass less than zero.  Let's see what that translates into.
+
+```{r omega}
+Hour = c(-7:3)
+Omega0=sample(jags_fit$BUGSoutput$sims.list$omega0,10000,replace=T)
+Omega1=sample(jags_fit$BUGSoutput$sims.list$omega1,10000,replace=T)
+Omega2=sample(jags_fit$BUGSoutput$sims.list$omega2,10000,replace=T)
+Mean = Lower = Upper = matrix(0,2,length(Hour))
+for(ihr in 1:length(Hour)){
+  Preds = Omega0*Hour[ihr] + Omega1*Hour[ihr]^2 
+  Preds2 = Preds + Omega2*Hour[ihr]
+  Mean[1,ihr] = mean(Preds)
+  Mean[2,ihr] = mean(Preds2)
+  Lower[1,ihr] = quantile(Preds,0.025)
+  Upper[1,ihr] = quantile(Preds,0.975)
+  Lower[2,ihr] = quantile(Preds2,0.025)
+  Upper[2,ihr] = quantile(Preds2,0.975)
+}
+  
+Plot.df = data.frame(Hour=rep(Hour,2),Mean = 
+        as.vector(t(Mean)),Lower=as.vector(t(Lower)),Upper=as.vector(t(Upper)),
+        FLIR=c(rep(0,length(Hour)),rep(1,length(Hour))))
+library(ggplot2)
+ggplot()+geom_line(data=Plot.df,aes(x=Hour,y=Mean,group=FLIR,color=FLIR))+
+  geom_ribbon(data=Plot.df,aes(x=Hour,ymin=Lower,ymax=Upper,group=FLIR,fill=FLIR),alpha=0.4)+
+  ylab('Effect (log-scale)')
+
+```
+
+The interpretation here is the effect of "hour-of-day" relative to base conditions (sky cover = 0, solar noon, observer experience = 0).  So it looks like the human observer method (gray) has a peak slightly before solar noon, though the overall effect doesn't change much from say hour -5 (5 hours before solar noon) up to solar noon itself.  However, predicted FLIR counts are much higher at the beginning of the survey day than the end of the survey day.  In fact we would predict counts to be $\exp(1) = 2.7$, or 170\% higher at the beginning of the day for the FLIR compared to solar noon for human observers!
+
+\textbf{Sky cover}
+
+The posterior distribution for $\kappa$ had a mode above zero, but there was also some mass ($\approx 5\%$) below zero
+
+```{r kappa}
+Kappa=sample(jags_fit$BUGSoutput$sims.list$kappa,10000,replace=T)
+quantile(Kappa,0.05)
+```
+
+
+We can interpret this as moderate evidence of higher counts by the FLIR when there was greater sky cover. Let's plot the relationship
+
+```{r kappa plot}
+Cover = c(0:10)/10
+Mean = Lower = Upper = rep(0,length(Cover))
+for(icov in 1:length(Cover)){
+  Preds = Kappa*Cover[icov]
+  Mean[icov] = mean(Preds)
+  Lower[icov] = quantile(Preds,0.025)
+  Upper[icov] = quantile(Preds,0.975)
+}
+  
+Plot.df = data.frame(Sky_cover=Cover,Mean = 
+        Mean,Lower=Lower,Upper=Upper)
+library(ggplot2)
+ggplot()+geom_line(data=Plot.df,aes(x=Sky_cover,y=Mean))+
+  geom_ribbon(data=Plot.df,aes(x=Sky_cover,ymin=Lower,ymax=Upper),alpha=0.4)+
+  ylab('Effect (log-scale)')
+
+```
+
+However, the mean prediction was $\approx 45\%$ higher counts with complete cloud cover compared to zero cloud cover. 
+
+\textbf{Tide effects}
+
+Although not related to performance of the FLIR, we accounted for tide effects (time from nearest low tide) as it has been shown to affect harbor seal aerial survey counts (Ver Hoef et al. 2003).  
+
+
+```{r theta}
+Tide = c(-6:6)
+Theta1=sample(jags_fit$BUGSoutput$sims.list$theta1,10000,replace=T)
+Theta2=sample(jags_fit$BUGSoutput$sims.list$theta2,10000,replace=T)
+Mean = Lower = Upper = rep(0,length(Tide))
+for(ihr in 1:length(Tide)){
+  Preds = Theta1*Tide[ihr] + Theta2*Tide[ihr]^2 
+  Mean[ihr] = mean(Preds)
+  Lower[ihr] = quantile(Preds,0.025)
+  Upper[ihr] = quantile(Preds,0.975)
+}
+  
+Plot.df = data.frame(Hour=Tide,Mean = Mean,Lower=Lower,Upper=Upper)
+library(ggplot2)
+ggplot()+geom_line(data=Plot.df,aes(x=Hour,y=Mean))+
+  geom_ribbon(data=Plot.df,aes(x=Hour,ymin=Lower,ymax=Upper),alpha=0.4)+
+  ylab('Effect (log-scale)')+xlab('Hour from low tide')
+
+```
+
+So this plot is a bit counter-intuitive, since we generally expect counts to be highest close to low tide, but here it's suggesting counts are weakly \textit{lowest} close to low tide.  I'm not sure exactly why this is, although it's clear that accounting for different sources of uncertainty impact estimation of relationship.  For instance, here's some GAMs both accounting and not accounting for polygon ID in estimation of the tide effect:
+
+
+```{r gam:tide1}
+plot(mgcv::gam(Count~s(X[,11]),family="poisson"),xlab="Hours from low tide",ylab="Smooth")
+
+```
+
+```{r gam:tide2}
+plot(mgcv::gam(Count~Polys+s(X[,11]),family="poisson"),xlab="Hours from low tide",ylab="Smooth")
+
+```
+
+Looking at this last plot you can kind of see why a minimum near zero was estimated in the quadratic Bayesian model, though it's not clear why this differs from what has been found in the past (e.g. in Jay's harbor seal models).
+
+
+## Implications for detection
+
+Performance of the two methods (human observer vs. FLIR) clearly varies as a function of a number of factors, including time-of-day, observer experience, and proportion sky cover.  Here, I give estimated relative detection efficiency of the FLIR relative to human observers, where human observer detection efficiency is calculated relative to solar noon for three levels of FLIR observer experience (0 previous polygons, 6 previous polygons, and 12 previous polygons).  In each case we'll look at mean posterior predictions for different hour-of-day (relative to solar noon) and sky cover conditions.  Values above 1 indicate improved efficiency relative to human observers at solar noon, while values less than 1 indicate reduced efficiency.
+
+
+```{r det efficiency}
+
+Hour = c(-7:3)
+Sky_cover = c(0.025,0.175,0.425,0.75,0.975)  #midpoints of observed sky cover bins
+Observer_hrs = c(0,6,12)
+n_row = length(Sky_cover)*length(Hour)
+for(iobs in 1:3){
+  Rel_eff = data.frame(Rel_eff=rep(0,n_row),Hour=rep(0,n_row),Sky_cover=rep(0,n_row))
+  irow=1
+  for(ihr in 1:length(Hour)){
+    for(isky in 1:length(Sky_cover)){
+      Rel_eff$Hour[irow]=Hour[ihr]
+      Rel_eff$Sky_cover[irow]=Sky_cover[isky]
+      Rel_eff$Rel_eff[irow] = mean(exp(Kappa*Sky_cover[isky] + Omega0*Hour[ihr] + Omega1*Hour[ihr]^2 + Omega2*Hour[ihr] + 
+                                    Xi*Observer_hrs[iobs]))
+      irow=irow+1
+    }
+  }
+  #knitr::kable(Rel_eff,caption=paste("Observer hours = ",Observer_hrs[iobs]))
+  print(paste("Observer hours = ",Observer_hrs[iobs]))
+  print(Rel_eff)
+}
+
+
+
+```
+
+This is pretty amazing.  Up until solar noon, it looks like the FLIR outperforms human observers in counting seals, especially when observers have experience and cloud cover is high.  However, time-of-day seems to be the most important predictor, with counts predicted to be up to 6 times as high in the morning with the FLIR compared to human observers at solar noon.  This is just predictions from a model though (potentially subject to extrapolation "past the realm of observed data"), so it might be good to groundtruth things a bit.  Let's see if there are examples of polygons surveyed near the beginning of the day with FLIR vs. human observers and compare counts
+
+```{r compare counts}
+
+Which_FLIR_early = which(New_data$FLIR==1 & New_data$solar_hr<(-4))
+FLIR_obs = New_data$num_seals[Which_FLIR_early]
+X_rep_new = X_rep[71:199,]
+Label = rep(0,nrow(New_data))
+for(i in 1:ncol(X_rep_new)){
+  Label[which(X_rep_new[,i]==1)]=i
+}
+New_data$Label=Label
+FLIR_labels = Label[Which_FLIR_early]
+Hum_obs = rep(NA,length(FLIR_labels))
+Hum_data = New_data[New_data$FLIR==0,]
+Hum_data[which(is.na(Hum_data$num_seals)),"num_seals"]=0
+for(i in 1:length(FLIR_labels)){
+  cur_which = which(Hum_data$Label==FLIR_labels[i])
+  if(length(cur_which)>0)Hum_obs[i]=Hum_data[cur_which,"num_seals"]
+}
+FLIR_obs[is.na(FLIR_obs)]=0
+FLIR_obs=FLIR_obs[-which(is.na(Hum_obs))]  #not all FLIR passes have a match
+Hum_obs = Hum_obs[-which(is.na(Hum_obs))]
+
+plot(Hum_obs,FLIR_obs)
+abline(0,1)
+
+
+```
+
+
+
+Clearly the FLIR has better performance than human observers early in the day (data here are limited to survey pairs where the FLIR was conducted >4 hours prior to solar noon), but probably not as extreme as the relative efficiency values predicted by the model.  In particular, there is more agreement (proportionally) for larger counts.  But there are multiple observations where $<10$ (and often zero animals) are recorded by human observers but much higher numbers are seen by the FLIR.  These seem to be the primary drivers of the high relative efficiency levels achieved by the FLIR early in the day.
+
+
+## Discussion
+
+The FLIR method detects more seals than human observers early in the day, and to a lesser extent, when cloud cover is greater and when observers have experience.  The relative improvement in performance is particularly notable when seal abundance at a polygon is realtively low (e.g. $<100$ seals).  These observations suggest that detection probability of human observers in the Aleutians is quite low, especially when seals are less numerous.  Perhaps there is an effect similar to whales where observers are much more likely to detect large pods of whales and smaller ones.  This makes sense given that the distinctiveness of seals on the rocky substrates typical of the Aleutian islands is relatively low.  Altitude of FLIR surveys did not seem to matter as much.
+
+It is worth thinking about the possible costs and benefits of using the FLIR as part of the existing monitoring program for seals in Alaska (and, specifically, for the Aleutian Islands).  First, it seems apparent that detection probability of human observers can be quite poor and variable, depending on underlying abundance.  As such, harbor seal counts are likely much smaller than true population size, and are thus untrustworthy for making statements about absolute abundance.  Detection probability of the FLIR is much higher, especially earlier in the day and in polygons where seal abundance is lower, although it still probably isn't perfect even in ideal conditions.  Second, as I understand it, inferences from current harbor seal monitoring programs are largely made with respect to \textit{trend} instead of absolute abundance.  Trends may still be well estimated for Aleutian harbor seals even if human observer counts substantially underestimate abundance.  However, if detection probability is positively related to seal density, there may be an exacerbating effect where increases at low abundance sites lead to much higher estimates of polygon-specific trend than actually occurred (and vice versa).  This would not be good, but if total trends depend primarily on high density polygons, it may not be as big of an issue.  
+
+On the other hand, in order to incorporate FLIR counts into existing monitoring programs, there would be a need to control for differences between present and future survey methods, taking into account information on time-of-day, observer experience, and sky cover in the trend estimation model.  Although this could be done in theory, it would introduce additional variance as uncertainty in such relationships would need to be propagated into final trend estimates. It would also make the underlying count data model much more complicated.
+
+
+
+
+
+
